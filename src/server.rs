@@ -168,7 +168,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:80".to_string(),
+            bind_address: "0.0.0.0:80".to_string(),
             max_clients: 100,
             heartbeat_interval: Duration::from_secs(30),
             client_timeout: Duration::from_secs(90),

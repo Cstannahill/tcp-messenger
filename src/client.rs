@@ -201,8 +201,10 @@ impl ConnectionManager {
                     self.stream = Some(stream);
                     self.retry_count = 0;
                     println!("[Client] Connection and handshake successful to {} as '{}'", self.address, self.username);
-                    // No try_clone: just return the stream
-                    return Ok(self.stream.take().unwrap());
+                    // Store the stream and return a clone/reference - but TcpStream doesn't support clone
+                    // Instead, store it and take only when needed
+                    let stream = self.stream.take().unwrap();
+                    return Ok(stream);
                 }
                 Err(e) => {
                     eprintln!("[Client] Connection attempt {} failed: {}", attempt + 1, e);
@@ -311,7 +313,9 @@ impl ChatClient {
     pub async fn connect(&mut self) -> Result<(), ClientError> {
         println!("[Client] Connecting to server at {}...", self.connection_manager.address);
         match self.connection_manager.connect().await {
-            Ok(_stream) => {
+            Ok(stream) => {
+                // Store the stream back in the connection manager
+                self.connection_manager.stream = Some(stream);
                 self.running.store(true, Ordering::SeqCst);
                 println!("[Client] Connected to server! You can now start chatting.");
                 println!("[Client] Commands: /help, /users, /channels, /stats, /quit");

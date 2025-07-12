@@ -31,7 +31,7 @@ fn main() {
                 input.trim().to_string()
             });
 
-            let address = args.get(3).cloned().unwrap_or_else(|| "127.0.0.1:80".to_string());
+            let address = args.get(3).cloned().unwrap_or_else(|| "192.168.0.112:80".to_string());
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(run_client(username, address)) {
