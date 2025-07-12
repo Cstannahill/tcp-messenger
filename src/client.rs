@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, Ordering}};
-use std::thread;
-use std::time::Duration;
+use std::io::{self, Write};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Mutex};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use tokio::time::{sleep, Duration};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -184,36 +184,40 @@ impl ConnectionManager {
             max_retries: 3,
         }
     }
-
-    fn connect(&mut self) -> Result<TcpStream, ClientError> {
+    async fn connect(&mut self) -> Result<TcpStream, ClientError> {
+        use tokio::io::AsyncWriteExt;
+        println!("[Client] Attempting to connect to server at {} as username '{}'", self.address, self.username);
         for attempt in 0..=self.max_retries {
-            match TcpStream::connect(&self.address) {
-                Ok(stream) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-                    stream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
-                    
+            println!("[Client] Connection attempt {} to {}", attempt + 1, self.address);
+            match TcpStream::connect(&self.address).await {
+                Ok(mut stream) => {
+                    println!("[Client] TCP connection established to {}", self.address);
                     // Perform handshake
-                    let mut handshake_stream = stream.try_clone()?;
-                    writeln!(handshake_stream, "{}", self.username)?;
-                    handshake_stream.flush()?;
-                    
-                    self.stream = Some(stream.try_clone()?);
+                    println!("[Client] Sending handshake with username '{}'", self.username);
+                    if let Err(e) = stream.write_all(format!("{}\n", self.username).as_bytes()).await {
+                        eprintln!("[Client] Failed to send handshake: {}", e);
+                        return Err(ClientError::IoError(format!("Failed to send handshake: {}", e)));
+                    }
+                    self.stream = Some(stream);
                     self.retry_count = 0;
-                    
-                    return Ok(stream);
+                    println!("[Client] Connection and handshake successful to {} as '{}'", self.address, self.username);
+                    // No try_clone: just return the stream
+                    return Ok(self.stream.take().unwrap());
                 }
                 Err(e) => {
+                    eprintln!("[Client] Connection attempt {} failed: {}", attempt + 1, e);
                     if attempt < self.max_retries {
-                        eprintln!("Connection attempt {} failed: {}. Retrying in 2s...", attempt + 1, e);
-                        thread::sleep(Duration::from_secs(2));
+                        let delay = 8 + attempt * 4;
+                        println!("[Client] Retrying in {} seconds for mobile robustness...", delay);
+                        sleep(Duration::from_secs(delay as u64)).await;
                     } else {
+                        eprintln!("[Client] All connection attempts failed. Giving up.");
                         return Err(ClientError::ConnectionError(format!("Failed after {} attempts: {}", self.max_retries + 1, e)));
                     }
                 }
             }
         }
-        
+        eprintln!("[Client] Max retries exceeded. Unable to connect to server at {}", self.address);
         Err(ClientError::ConnectionError("Max retries exceeded".to_string()))
     }
 
@@ -263,9 +267,38 @@ impl ClientStats {
 }
 
 impl ChatClient {
+    async fn input_loop_concurrent(message_tx: mpsc::Sender<String>, mut shutdown_rx: mpsc::Receiver<()>) -> Result<(), ClientError> {
+        use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader, stdin as async_stdin};
+        let mut stdin = AsyncBufReader::new(async_stdin());
+        loop {
+            let mut input = String::new();
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+                result = stdin.read_line(&mut input) => {
+                    let bytes_read = result?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    let line = input.trim().to_string();
+                    if line == "/quit" {
+                        break;
+                    }
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if message_tx.send(line).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(username: String, server_address: String) -> Self {
         let connection_manager = ConnectionManager::new(server_address, username);
-        
         Self {
             connection_manager,
             running: Arc::new(AtomicBool::new(false)),
@@ -275,125 +308,170 @@ impl ChatClient {
         }
     }
 
-    pub fn connect(&mut self) -> Result<(), ClientError> {
-        println!("Connecting to server at {}...", self.connection_manager.address);
-        
-        let _stream = self.connection_manager.connect()?;
-        self.running.store(true, Ordering::SeqCst);
-
-        println!("Connected to server! You can now start chatting.");
-        println!("Commands: /help, /users, /channels, /stats, /quit");
-        println!("Type your message and press Enter to send.");
-
-        Ok(())
+    pub async fn connect(&mut self) -> Result<(), ClientError> {
+        println!("[Client] Connecting to server at {}...", self.connection_manager.address);
+        match self.connection_manager.connect().await {
+            Ok(_stream) => {
+                self.running.store(true, Ordering::SeqCst);
+                println!("[Client] Connected to server! You can now start chatting.");
+                println!("[Client] Commands: /help, /users, /channels, /stats, /quit");
+                println!("[Client] Type your message and press Enter to send.");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[Client] Failed to connect: {}", e);
+                Err(e)
+            }
+        }
     }
 
-    pub fn start_interactive_session(&mut self) -> Result<(), ClientError> {
+    /// Auto-reconnect loop with exponential backoff
+    pub async fn run_with_auto_reconnect(&mut self) {
+        let mut backoff = 2;
+        let max_backoff = 60;
+        loop {
+            match self.connect().await {
+                Ok(()) => {
+                    backoff = 2;
+                    let session_result = self.start_interactive_session().await;
+                    match session_result {
+                        Ok(()) => {
+                            println!("Session ended gracefully.");
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Session error: {}", e);
+                            println!("Attempting to reconnect in {} seconds...", backoff);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Connection error: {}", e);
+                    println!("Reconnecting in {} seconds...", backoff);
+                }
+            }
+            sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    pub async fn start_interactive_session(&mut self) -> Result<(), ClientError> {
+        // Receiver task needs these clones
+        // Extract stream and create shutdown/message channels at the top
         let stream = self.connection_manager.stream.take()
             .ok_or(ClientError::ConnectionError("Not connected to server".to_string()))?;
-        
-        // Create channels for coordinated shutdown
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let (message_tx, message_rx) = mpsc::channel();
-        
-        self.message_tx = Some(message_tx);
-        self.shutdown_rx = Some(shutdown_rx);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (message_tx, message_rx) = mpsc::channel(32);
 
-        // Start message receiving thread
-        let reader_stream = stream.try_clone()?;
-        let running_clone = Arc::clone(&self.running);
-        let username_clone = self.connection_manager.username.clone();
-        let stats_clone = Arc::clone(&self.stats);
-        let shutdown_tx_clone = shutdown_tx.clone();
-        
-        let receiver_handle = thread::spawn(move || -> Result<(), ClientError> {
+        self.message_tx = Some(message_tx.clone());
+        // Do not assign shutdown_rx to self; it is moved into the input loop task below
+
+        // Split the stream for concurrent tasks
+        let (reader_stream, writer_stream) = stream.into_split();
+
+        // Receiver task
+        let receiver_handle = tokio::spawn({
+            let running_clone = Arc::clone(&self.running);
+            let username_clone = self.connection_manager.username.clone();
+            let stats_clone = Arc::clone(&self.stats);
+            let shutdown_tx_clone = shutdown_tx.clone();
             Self::message_receiver(reader_stream, running_clone, username_clone, stats_clone, shutdown_tx_clone)
         });
 
-        // Start heartbeat thread
-        let heartbeat_stream = stream.try_clone()?;
+        // Unused variables removed
+        // Heartbeat and sender both want to write; refactor: heartbeat sends to sender via channel
+        // Create a heartbeat channel
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel(8);
         let running_clone = Arc::clone(&self.running);
         let username_clone = self.connection_manager.username.clone();
         let stats_clone = Arc::clone(&self.stats);
-        
-        let heartbeat_handle = thread::spawn(move || -> Result<(), ClientError> {
-            Self::heartbeat_sender(heartbeat_stream, running_clone, username_clone, stats_clone)
+        let heartbeat_handle = tokio::spawn(async move {
+            while running_clone.load(Ordering::SeqCst) {
+                sleep(Duration::from_secs(25)).await;
+                if !running_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+                let heartbeat = Message::new_heartbeat(username_clone.clone());
+                if heartbeat_tx.send(heartbeat).await.is_err() {
+                    break;
+                }
+                stats_clone.lock().await.heartbeats_sent += 1;
+            }
+            Ok::<(), ClientError>(())
         });
 
-        // Start message sending thread
-        let writer_stream = stream;
-        let running_clone = Arc::clone(&self.running);
-        let username_clone = self.connection_manager.username.clone();
-        let stats_clone = Arc::clone(&self.stats);
-        
-        let sender_handle = thread::spawn(move || -> Result<(), ClientError> {
-            Self::message_sender(writer_stream, running_clone, username_clone, stats_clone, message_rx)
+        // Sender task: receives from both message_rx and heartbeat_rx
+        // Unused variables removed
+        let sender_handle = tokio::spawn({
+            let mut message_rx = message_rx;
+            let mut heartbeat_rx = heartbeat_rx;
+            let mut writer_stream = writer_stream;
+            let running_clone = Arc::clone(&self.running);
+            let username_clone = self.connection_manager.username.clone();
+            let stats_clone = Arc::clone(&self.stats);
+            async move {
+                use tokio::io::AsyncWriteExt;
+                loop {
+                    tokio::select! {
+                        Some(input) = message_rx.recv() => {
+                            let result = if input.starts_with('/') {
+                                writer_stream.write_all(format!("{}\n", input).as_bytes()).await.map_err(ClientError::from)
+                            } else {
+                                let message = Message::new_chat(username_clone.clone(), input);
+                                let json = serde_json::to_string(&message)?;
+                                writer_stream.write_all(format!("{}\n", json).as_bytes()).await.map_err(ClientError::from)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    stats_clone.lock().await.messages_sent += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to send message: {}", e);
+                                    stats_clone.lock().await.connection_errors += 1;
+                                    running_clone.store(false, Ordering::SeqCst);
+                                    break;
+                                }
+                            }
+                        }
+                        Some(heartbeat) = heartbeat_rx.recv() => {
+                            let json = serde_json::to_string(&heartbeat)?;
+                            if let Err(e) = writer_stream.write_all(format!("{}\n", json).as_bytes()).await {
+                                eprintln!("Failed to send heartbeat: {}", e);
+                                stats_clone.lock().await.connection_errors += 1;
+                                running_clone.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                        else => { break; }
+                    }
+                }
+                Ok::<(), ClientError>(())
+            }
         });
 
-        // Main input loop
-        self.input_loop()?;
+        // Legacy sender task removed; all sending is handled in the new sender task above
 
-        // Graceful shutdown
-        self.running.store(false, Ordering::SeqCst);
-        drop(self.message_tx.take()); // Close the channel
-        
-        // Wait for threads to finish with timeout
-        let handles = vec![receiver_handle, heartbeat_handle, sender_handle];
+        // Main input loop runs concurrently with shutdown signal
+        // No need for mut, just move shutdown_rx into the input loop task
+        let input_handle = tokio::spawn(async move {
+            Self::input_loop_concurrent(message_tx, shutdown_rx).await
+        });
+
+        // Wait for tasks to finish
+        let handles = vec![receiver_handle, heartbeat_handle, sender_handle, input_handle];
         for handle in handles {
-            if handle.join().is_err() {
-                eprintln!("Warning: Thread failed to join cleanly");
+            if let Err(e) = handle.await {
+                eprintln!("Warning: Task failed to join cleanly: {:?}", e);
             }
         }
 
         // Print final statistics
-        self.stats.lock().unwrap().print_stats();
+        let stats = self.stats.lock().await;
+        stats.print_stats();
         println!("Disconnected from server.");
         Ok(())
     }
-
-    fn input_loop(&mut self) -> Result<(), ClientError> {
-        let stdin = io::stdin();
-        let message_tx = self.message_tx.as_ref().unwrap();
-        
-        for line in stdin.lock().lines() {
-            let input = line.map_err(|e| ClientError::IoError(e.to_string()))?;
-            
-            if input.trim() == "/quit" {
-                break;
-            }
-
-            if input.trim().is_empty() {
-                continue;
-            }
-
-            // Handle local commands
-            if input.starts_with('/') {
-                match input.trim() {
-                    "/help" => {
-                        self.print_help();
-                        continue;
-                    }
-                    "/stats" => {
-                        self.stats.lock().unwrap().print_stats();
-                        continue;
-                    }
-                    _ => {
-                        // Send command to server
-                        if message_tx.send(input.trim().to_string()).is_err() {
-                            break; // Channel closed
-                        }
-                    }
-                }
-            } else {
-                // Send chat message
-                if message_tx.send(input.trim().to_string()).is_err() {
-                    break; // Channel closed
-                }
-            }
-        }
-
-        Ok(())
-    }
+    // End of ChatClient impl
 
     fn print_help(&self) {
         println!("Available commands:");
@@ -404,141 +482,83 @@ impl ChatClient {
         println!("  /quit     - Exit the chat");
     }
 
-    fn message_receiver(
-        stream: TcpStream,
-        running: Arc<AtomicBool>,
-        _username: String,
-        stats: Arc<Mutex<ClientStats>>,
-        shutdown_tx: mpsc::Sender<()>,
-    ) -> Result<(), ClientError> {
-        let mut reader = BufReader::new(stream);
-        let mut buffer = String::new();
+async fn message_receiver(
+stream: tokio::net::tcp::OwnedReadHalf,
+    running: Arc<AtomicBool>,
+    _username: String,
+    stats: Arc<Mutex<ClientStats>>,
+    shutdown_tx: mpsc::Sender<()>,
+) -> Result<(), ClientError> {
+    use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
+    let mut reader = AsyncBufReader::new(stream);
+    let mut buffer = String::new();
 
-        while running.load(Ordering::SeqCst) {
-            buffer.clear();
-            match reader.read_line(&mut buffer) {
-                Ok(0) => {
-                    println!("\nServer disconnected.");
-                    running.store(false, Ordering::SeqCst);
-                    let _ = shutdown_tx.send(());
-                    break;
-                }
-                Ok(_) => {
-                    let received = buffer.trim();
-                    if received.is_empty() {
-                        continue;
-                    }
-
-                    // Parse incoming message
-                    match serde_json::from_str::<Message>(received) {
-                        Ok(message) => {
-                            Self::display_message(&message);
-                            stats.lock().unwrap().messages_received += 1;
-                        }
-                        Err(_) => {
-                            // Handle non-JSON responses (like command responses)
-                            println!("Server: {}", received);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::TimedOut {
-                        continue;
-                    }
-                    eprintln!("Error reading from server: {}", e);
-                    stats.lock().unwrap().connection_errors += 1;
-                    running.store(false, Ordering::SeqCst);
-                    let _ = shutdown_tx.send(());
-                    break;
-                }
+    while running.load(Ordering::SeqCst) {
+        buffer.clear();
+        let bytes_read = reader.read_line(&mut buffer).await?;
+        if bytes_read == 0 {
+            println!("\nServer disconnected.");
+            running.store(false, Ordering::SeqCst);
+            let _ = shutdown_tx.send(());
+            break;
+        }
+        let received = buffer.trim();
+        if received.is_empty() {
+            continue;
+        }
+        // Parse incoming message
+        match serde_json::from_str::<Message>(received) {
+            Ok(message) => {
+                Self::display_message(&message);
+                stats.lock().await.messages_received += 1;
+            }
+            Err(_) => {
+                // Handle non-JSON responses (like command responses)
+                println!("Server: {}", received);
             }
         }
-
-        Ok(())
     }
+    Ok(())
+}
 
-    fn message_sender(
-        mut stream: TcpStream,
-        running: Arc<AtomicBool>,
-        username: String,
-        stats: Arc<Mutex<ClientStats>>,
-        message_rx: mpsc::Receiver<String>,
-    ) -> Result<(), ClientError> {
-        while running.load(Ordering::SeqCst) {
-            match message_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(input) => {
-                    let result = if input.starts_with('/') {
-                        // Send command to server
-                        writeln!(stream, "{}", input).map_err(ClientError::from)
-                    } else {
-                        // Send chat message
-                        let message = Message::new_chat(username.clone(), input);
-                        let json = serde_json::to_string(&message)?;
-                        writeln!(stream, "{}", json).map_err(ClientError::from)
-                    };
-
-                    match result {
-                        Ok(()) => {
-                            stream.flush()?;
-                            stats.lock().unwrap().messages_sent += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to send message: {}", e);
-                            stats.lock().unwrap().connection_errors += 1;
-                            running.store(false, Ordering::SeqCst);
-                            break;
-                        }
+async fn message_sender(
+    mut stream: tokio::net::tcp::OwnedWriteHalf,
+    running: Arc<AtomicBool>,
+    username: String,
+    stats: Arc<Mutex<ClientStats>>,
+    mut message_rx: mpsc::Receiver<String>,
+) -> Result<(), ClientError> {
+    use tokio::io::AsyncWriteExt;
+    while running.load(Ordering::SeqCst) {
+        match message_rx.recv().await {
+            Some(input) => {
+                let result = if input.starts_with('/') {
+                    stream.write_all(format!("{}\n", input).as_bytes()).await.map_err(ClientError::from)
+                } else {
+                    let message = Message::new_chat(username.clone(), input);
+                    let json = serde_json::to_string(&message)?;
+                    stream.write_all(format!("{}\n", json).as_bytes()).await.map_err(ClientError::from)
+                };
+                match result {
+                    Ok(()) => {
+                    stats.lock().await.messages_sent += 1;
                     }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    continue; // Check running flag
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break; // Channel closed
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn heartbeat_sender(
-        mut stream: TcpStream,
-        running: Arc<AtomicBool>,
-        username: String,
-        stats: Arc<Mutex<ClientStats>>,
-    ) -> Result<(), ClientError> {
-        while running.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_secs(25));
-            
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let heartbeat = Message::new_heartbeat(username.clone());
-            let json = serde_json::to_string(&heartbeat)?;
-            
-            match writeln!(stream, "{}", json) {
-                Ok(()) => {
-                    if let Err(e) = stream.flush() {
-                        eprintln!("Failed to flush heartbeat: {}", e);
-                        stats.lock().unwrap().connection_errors += 1;
+                    Err(e) => {
+                        eprintln!("Failed to send message: {}", e);
+                        stats.lock().await.connection_errors += 1;
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
-                    stats.lock().unwrap().heartbeats_sent += 1;
-                }
-                Err(e) => {
-                    eprintln!("Failed to send heartbeat: {}", e);
-                    stats.lock().unwrap().connection_errors += 1;
-                    running.store(false, Ordering::SeqCst);
-                    break;
                 }
             }
+            None => {
+                break; // Channel closed
+            }
         }
-
-        Ok(())
     }
+    Ok(())
+}
+
 
     fn display_message(message: &Message) {
         match &message.message_type {
@@ -628,33 +648,34 @@ impl MessageBatch {
         self
     }
 
-    pub fn send_batch(&self, username: String) -> Result<(), ClientError> {
-        let mut connection_manager = ConnectionManager::new(self.server_address.clone(), username);
-        let mut stream = connection_manager.connect()?;
-
+    pub async fn send_batch(&self, username: String) -> Result<(), ClientError> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::sleep;
+        let mut connection_manager = ConnectionManager::new(self.server_address.clone(), username.clone());
+        let stream = connection_manager.connect().await?;
+        let mut write_half = stream.into_split().1;
         let chunks: Vec<_> = self.messages.chunks(self.batch_size).collect();
-        
+        // Send each batch sequentially (concurrent writing to same stream is not safe)
         for (i, chunk) in chunks.iter().enumerate() {
-            if i > 0 {
-                thread::sleep(self.delay_between_batches);
+            let delay = if i > 0 { self.delay_between_batches } else { Duration::from_millis(0) };
+            if delay > Duration::from_millis(0) {
+                sleep(delay).await;
             }
-
             for message in chunk.iter() {
-                let json = serde_json::to_string(message)?;
-                writeln!(stream, "{}", json)?;
-                stream.flush()?;
+                let json = serde_json::to_string(&message)?;
+                write_half.write_all(format!("{}\n", json).as_bytes()).await?;
             }
         }
-
         println!("Sent {} messages in {} batches", self.messages.len(), chunks.len());
         Ok(())
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("TCP Messaging Client v2.0");
     println!("==========================");
-    
+
     // Enhanced command line argument parsing
     let args: Vec<String> = std::env::args().collect();
     let username = if args.len() > 1 {
@@ -672,22 +693,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let server_address = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:10210".to_string());
+    let server_address = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:80".to_string());
     let mut client = ChatClient::new(username, server_address);
 
-    match client.connect() {
-        Ok(()) => {
-            if let Err(e) = client.start_interactive_session() {
-                eprintln!("Session error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to connect to server: {}", e);
-            eprintln!("Make sure the server is running on the specified address");
-            std::process::exit(1);
-        }
-    }
+    client.run_with_auto_reconnect().await;
 
     Ok(())
 }
@@ -696,45 +705,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 pub mod examples {
     use super::*;
 
-    pub fn send_single_message(username: &str, content: &str) -> Result<(), ClientError> {
-        let mut connection_manager = ConnectionManager::new("127.0.0.1:10210".to_string(), username.to_string());
-        let mut stream = connection_manager.connect()?;
-        
+    pub async fn send_single_message(username: &str, content: &str) -> Result<(), ClientError> {
+        let mut connection_manager = ConnectionManager::new("127.0.0.1:80".to_string(), username.to_string());
+        let stream = connection_manager.connect().await?;
+        let mut write_half = stream.into_split().1;
+        use tokio::io::AsyncWriteExt;
         let message = Message::new_chat(username.to_string(), content.to_string());
         let json = serde_json::to_string(&message)?;
-        writeln!(stream, "{}", json)?;
-        stream.flush()?;
-        
+        write_half.write_all(format!("{}\n", json).as_bytes()).await?;
         println!("Message sent successfully!");
         Ok(())
     }
 
-    pub fn send_message_sequence(username: &str, messages: Vec<&str>) -> Result<(), ClientError> {
-        let mut batch = MessageBatch::new("127.0.0.1:10210".to_string())
+    pub async fn send_message_sequence(username: &str, messages: Vec<&str>) -> Result<(), ClientError> {
+        let mut batch = MessageBatch::new("127.0.0.1:80".to_string())
             .with_batch_size(5)
             .with_delay(Duration::from_millis(200));
-        
         for msg in messages {
             batch.add_message(username.to_string(), msg.to_string());
         }
-        
-        batch.send_batch(username.to_string())?;
+        batch.send_batch(username.to_string()).await?;
         Ok(())
     }
 
-    pub fn run_chat_bot(bot_name: &str, responses: Vec<&str>) -> Result<(), ClientError> {
-        let mut connection_manager = ConnectionManager::new("127.0.0.1:10210".to_string(), bot_name.to_string());
-        let mut stream = connection_manager.connect()?;
-
+    pub async fn run_chat_bot(bot_name: &str, responses: Vec<&str>) -> Result<(), ClientError> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::sleep;
+        let mut connection_manager = ConnectionManager::new("127.0.0.1:80".to_string(), bot_name.to_string());
+        let stream = connection_manager.connect().await?;
+        let mut write_half = stream.into_split().1;
         for response in &responses {
             let message = Message::new_chat(bot_name.to_string(), response.to_string());
             let json = serde_json::to_string(&message)?;
-            writeln!(stream, "{}", json)?;
-            stream.flush()?;
-            
-            thread::sleep(Duration::from_secs(2));
+            write_half.write_all(format!("{}\n", json).as_bytes()).await?;
+            sleep(Duration::from_secs(2)).await;
         }
-
         println!("Chat bot completed {} responses", responses.len());
         Ok(())
     }
@@ -744,13 +749,11 @@ pub mod examples {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_message_creation() {
+    #[tokio::test]
+    async fn test_message_creation() {
         let message = Message::new_chat("test_user".to_string(), "Hello, world!".to_string());
-        
         assert_eq!(message.sender, "test_user");
         assert_eq!(message.version, 1);
-        
         match message.message_type {
             MessageType::Chat { content } => {
                 assert_eq!(content, "Hello, world!");
@@ -759,33 +762,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_message_validation() {
+    #[tokio::test]
+    async fn test_message_validation() {
         let result = std::panic::catch_unwind(|| {
             Message::new_chat("test".to_string(), "".to_string())
         });
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_message_batch() {
-        let mut batch = MessageBatch::new("127.0.0.1:10210".to_string())
+    #[tokio::test]
+    async fn test_message_batch() {
+        let mut batch = MessageBatch::new("127.0.0.1:80".to_string())
             .with_batch_size(2)
             .with_delay(Duration::from_millis(50));
-        
         batch.add_message("user1".to_string(), "First message".to_string())
              .add_message_to_channel("user1".to_string(), "Channel message".to_string(), "test".to_string());
-        
         assert_eq!(batch.messages.len(), 2);
         assert_eq!(batch.messages[1].channel, Some("test".to_string()));
         assert_eq!(batch.batch_size, 2);
     }
 
-    #[test]
-    fn test_client_error_conversion() {
+    #[tokio::test]
+    async fn test_client_error_conversion() {
         let io_error = io::Error::new(io::ErrorKind::TimedOut, "timeout");
         let client_error = ClientError::from(io_error);
-        
         match client_error {
             ClientError::NetworkTimeout => {},
             _ => panic!("Expected NetworkTimeout"),

@@ -31,9 +31,10 @@ fn main() {
                 input.trim().to_string()
             });
 
-            let address = args.get(3).cloned().unwrap_or_else(|| "127.0.0.1:10210".to_string());
+            let address = args.get(3).cloned().unwrap_or_else(|| "127.0.0.1:80".to_string());
 
-            if let Err(e) = run_client(username, address) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Err(e) = rt.block_on(run_client(username, address)) {
                 eprintln!("Client failed: {}", e);
                 process::exit(1);
             }
@@ -54,9 +55,9 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     chat_server.run()
 }
 
-fn run_client(username: String, address: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(username: String, address: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = client::ChatClient::new(username, address);
-    client.connect()?;
-    client.start_interactive_session()?;
+    client.connect().await?;
+    client.start_interactive_session().await?;
     Ok(())
 }

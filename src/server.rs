@@ -168,7 +168,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:10210".to_string(),
+            bind_address: "127.0.0.1:80".to_string(),
             max_clients: 100,
             heartbeat_interval: Duration::from_secs(30),
             client_timeout: Duration::from_secs(90),
@@ -194,7 +194,7 @@ impl ChatServer {
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.config.bind_address)?;
-        info!("Chat server listening on {}", self.config.bind_address);
+        info!("[Server] Chat server listening on {}", self.config.bind_address);
 
         // Start background tasks
         self.start_heartbeat_monitor();
@@ -203,8 +203,10 @@ impl ChatServer {
         for stream_result in listener.incoming() {
             match stream_result {
                 Ok(stream) => {
+                    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+                    info!("[Server] Incoming connection attempt from {}", peer_addr);
                     if self.clients.read().unwrap().len() >= self.config.max_clients {
-                        warn!("Maximum client limit reached, rejecting connection");
+                        warn!("[Server] Maximum client limit reached, rejecting connection from {}", peer_addr);
                         continue;
                     }
 
@@ -215,12 +217,12 @@ impl ChatServer {
 
                     thread::spawn(move || {
                         if let Err(e) = Self::handle_client(stream, clients, channels, rate_limiter, config) {
-                            error!("Error handling client: {}", e);
+                            error!("[Server] Error handling client: {}", e);
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Error accepting connection: {}", e);
+                    error!("[Server] Error accepting connection: {}", e);
                 }
             }
         }
@@ -235,20 +237,38 @@ impl ChatServer {
         rate_limiter: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
         config: ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+        info!("[Server] Handling client from {}", peer_addr);
         let mut reader = BufReader::new(stream.try_clone()?);
-        
+
         // Initial handshake to get username
         let mut username_buffer = String::new();
-        reader.read_line(&mut username_buffer)?;
+        match reader.read_line(&mut username_buffer) {
+            Ok(n) => {
+                debug!("[Server] Read {} bytes for handshake from {}", n, peer_addr);
+            }
+            Err(e) => {
+                error!("[Server] Error reading handshake from {}: {}", peer_addr, e);
+                return Err(format!("Error reading handshake from {}: {}", peer_addr, e).into());
+            }
+        }
         let username = username_buffer.trim().to_string();
-        
+
         if username.is_empty() {
+            error!("[Server] Invalid (empty) username from {}", peer_addr);
             return Err("Invalid username".into());
         }
+        info!("[Server] Handshake successful from {} with username '{}'", peer_addr, username);
 
-        let mut client = Client::new(stream, username.clone())?;
+        let mut client = match Client::new(stream, username.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("[Server] Failed to create client object for {}: {}", username, e);
+                return Err(format!("Failed to create client object for {}: {}", username, e).into());
+            }
+        };
         let client_id = client.id.clone();
-        
+
         // Send welcome message
         let welcome_msg = Message::new(
             "system".to_string(),
@@ -256,11 +276,13 @@ impl ChatServer {
                 content: format!("Welcome to the chat server, {}!", username),
             },
         );
-        client.send_message(&welcome_msg)?;
+        if let Err(e) = client.send_message(&welcome_msg) {
+            error!("[Server] Failed to send welcome message to {}: {}", username, e);
+        }
 
         // Add client to server state
         clients.write().unwrap().insert(client_id.clone(), client);
-        
+
         // Add to general channel
         channels.write().unwrap()
             .get_mut("general")
@@ -272,7 +294,7 @@ impl ChatServer {
             "system".to_string(),
             MessageType::UserJoined { username: username.clone() },
         ).with_channel("general".to_string());
-        
+
         Self::broadcast_to_channel(&join_msg, "general", &clients, &channels)?;
 
         // Main message loop
@@ -280,33 +302,38 @@ impl ChatServer {
             let mut buffer = String::new();
             match reader.read_line(&mut buffer) {
                 Ok(0) => {
-                    info!("Client {} disconnected", username);
+                    info!("[Server] Client '{}' disconnected from {}", username, peer_addr);
                     break;
                 }
                 Ok(n) => {
+                    debug!("[Server] Read {} bytes from client '{}' at {}", n, username, peer_addr);
                     if n > config.max_message_size {
-                        warn!("Message too large from client {}", username);
+                        warn!("[Server] Message too large from client '{}' at {}", username, peer_addr);
                         continue;
                     }
 
                     // Rate limiting
                     if Self::is_rate_limited(&client_id, &rate_limiter, &config) {
-                        warn!("Rate limit exceeded for client {}", username);
+                        warn!("[Server] Rate limit exceeded for client '{}' at {}", username, peer_addr);
                         continue;
                     }
 
                     let received = buffer.trim();
-                    
+                    if received.is_empty() {
+                        debug!("[Server] Received empty message from client '{}' at {}", username, peer_addr);
+                        continue;
+                    }
+
                     // Parse and handle message
                     let message: Message = match serde_json::from_str(received) {
                         Ok(msg) => msg,
                         Err(e) => {
-                            error!("Error parsing JSON from client {}: {}", username, e);
+                            error!("[Server] Error parsing JSON from client '{}' at {}: {}", username, peer_addr, e);
                             continue;
                         }
                     };
 
-                    debug!("Received message from {}: {:?}", username, message);
+                    debug!("[Server] Received message from '{}' at {}: {:?}", username, peer_addr, message);
 
                     // Update client heartbeat
                     if let Some(client) = clients.write().unwrap().get_mut(&client_id) {
@@ -318,13 +345,14 @@ impl ChatServer {
                         MessageType::Chat { .. } => {
                             let channel = message.channel.as_deref().unwrap_or("general");
                             Self::broadcast_to_channel(&message, channel, &clients, &channels)?;
-                            
+
                             // Add to channel history
                             if let Some(ch) = channels.write().unwrap().get_mut(channel) {
                                 ch.add_message(message.clone());
                             }
                         }
                         MessageType::Heartbeat => {
+                            debug!("[Server] Received heartbeat from '{}' at {}", username, peer_addr);
                             // Heartbeat handled by client update above
                         }
                         _ => {
@@ -334,15 +362,16 @@ impl ChatServer {
                     }
                 }
                 Err(e) => {
-                    error!("Error reading from client {}: {}", username, e);
+                    error!("[Server] Error reading from client '{}' at {}: {}", username, peer_addr, e);
                     break;
                 }
             }
         }
 
         // Cleanup on disconnect
+        info!("[Server] Cleaning up client '{}' at {}", username, peer_addr);
         clients.write().unwrap().remove(&client_id);
-        
+
         // Remove from all channels
         for channel in channels.write().unwrap().values_mut() {
             channel.remove_member(&client_id);
@@ -353,7 +382,7 @@ impl ChatServer {
             "system".to_string(),
             MessageType::UserLeft { username },
         ).with_channel("general".to_string());
-        
+
         Self::broadcast_to_channel(&leave_msg, "general", &clients, &channels)?;
 
         Ok(())
