@@ -1,0 +1,35 @@
+# TCP Messaging Server Configuration
+
+[network]
+bind_address = "0.0.0.0"
+port = 80
+max_clients = 100
+tcp_keepalive = true
+keepalive_interval_secs = 30
+heartbeat_interval_secs = 30
+client_timeout_secs = 90
+
+[database]
+enabled = true
+url = "sqlite:./chat.db"
+pool_size = 10
+message_retention_days = 30
+
+[logging]
+level = "info"
+format = "pretty"  # "json" or "pretty"
+file_path = "./logs/tcp-messaging.log"
+max_file_size_mb = 100
+
+[limits]
+max_message_size = 8192
+message_rate_limit = 10
+rate_limit_window_secs = 60
+max_channels_per_user = 50
+
+[security]
+enable_tls = false
+# cert_file = "/path/to/cert.pem"
+# key_file = "/path/to/key.pem"
+require_auth = false
+# jwt_secret = "your-secret-key-here"

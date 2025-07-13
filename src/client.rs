@@ -6,27 +6,79 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::time::{sleep, Duration};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::file_transfer::{FileTransferManager, utils};
+use uuid;
+use chrono;
 
 // Custom error type for thread safety
 #[derive(Debug, Clone)]
 pub enum ClientError {
-    ConnectionError(String),
-    IoError(String),
-    SerializationError(String),
-    NetworkTimeout,
-    InvalidHandshake,
-    ServerDisconnected,
+    ConnectionError { 
+        address: String, 
+        reason: String, 
+        context: Option<String> 
+    },
+    IoError { 
+        operation: String, 
+        reason: String, 
+        context: Option<String> 
+    },
+    SerializationError { 
+        message_type: String, 
+        reason: String 
+    },
+    NetworkTimeout { 
+        operation: String, 
+        duration_ms: u64 
+    },
+    InvalidHandshake { 
+        expected: String, 
+        received: String 
+    },
+    ServerDisconnected { 
+        reason: String, 
+        last_activity: String 
+    },
+    ConfigurationError { 
+        field: String, 
+        value: String, 
+        reason: String 
+    },
 }
 
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
-            ClientError::IoError(msg) => write!(f, "IO error: {}", msg),
-            ClientError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
-            ClientError::NetworkTimeout => write!(f, "Network timeout"),
-            ClientError::InvalidHandshake => write!(f, "Invalid handshake"),
-            ClientError::ServerDisconnected => write!(f, "Server disconnected"),
+            ClientError::ConnectionError { address, reason, context } => {
+                match context {
+                    Some(ctx) => write!(f, "Failed to connect to {}: {} (Context: {})", address, reason, ctx),
+                    None => write!(f, "Failed to connect to {}: {}", address, reason),
+                }
+            },
+            ClientError::IoError { operation, reason, context } => {
+                match context {
+                    Some(ctx) => write!(f, "IO error during {}: {} (Context: {})", operation, reason, ctx),
+                    None => write!(f, "IO error during {}: {}", operation, reason),
+                }
+            },
+            ClientError::SerializationError { message_type, reason } => {
+                write!(f, "Failed to serialize/deserialize {}: {}", message_type, reason)
+            },
+            ClientError::NetworkTimeout { operation, duration_ms } => {
+                write!(f, "Network timeout during {} after {}ms", operation, duration_ms)
+            },
+            ClientError::InvalidHandshake { expected, received } => {
+                write!(f, "Handshake failed - expected: '{}', received: '{}'", expected, received)
+            },
+            ClientError::ServerDisconnected { reason, last_activity } => {
+                write!(f, "Server disconnected: {} (Last activity: {})", reason, last_activity)
+            },
+            ClientError::ConfigurationError { field, value, reason } => {
+                write!(f, "Configuration error in field '{}' with value '{}': {}", field, value, reason)
+            },
         }
     }
 }
@@ -36,18 +88,31 @@ impl std::error::Error for ClientError {}
 impl From<io::Error> for ClientError {
     fn from(error: io::Error) -> Self {
         match error.kind() {
-            io::ErrorKind::TimedOut => ClientError::NetworkTimeout,
+            io::ErrorKind::TimedOut => ClientError::NetworkTimeout {
+                operation: "IO operation".to_string(),
+                duration_ms: 0, // Duration not available from io::Error
+            },
             io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset => {
-                ClientError::ServerDisconnected
+                ClientError::ServerDisconnected {
+                    reason: error.to_string(),
+                    last_activity: chrono::Utc::now().to_rfc3339(),
+                }
             }
-            _ => ClientError::IoError(error.to_string()),
+            _ => ClientError::IoError {
+                operation: "General IO".to_string(),
+                reason: error.to_string(),
+                context: None,
+            },
         }
     }
 }
 
 impl From<serde_json::Error> for ClientError {
     fn from(error: serde_json::Error) -> Self {
-        ClientError::SerializationError(error.to_string())
+        ClientError::SerializationError {
+            message_type: "JSON".to_string(),
+            reason: error.to_string(),
+        }
     }
 }
 
@@ -62,6 +127,56 @@ pub enum MessageType {
     Heartbeat,
     Error { code: u32, message: String },
     CommandResponse { command: String, response: String },
+    // File transfer message types
+    FileUploadRequest { 
+        file_id: String, 
+        filename: String, 
+        file_size: u64, 
+        mime_type: String, 
+        checksum: String 
+    },
+    FileUploadResponse { 
+        file_id: String, 
+        accepted: bool, 
+        reason: Option<String>, 
+        chunk_size: usize 
+    },
+    FileChunk { 
+        file_id: String, 
+        chunk_index: u32, 
+        total_chunks: u32, 
+        data: String 
+    },
+    FileChunkAck { 
+        file_id: String, 
+        chunk_index: u32, 
+        received: bool 
+    },
+    FileUploadComplete { 
+        file_id: String, 
+        success: bool, 
+        message: String 
+    },
+    FileDownloadRequest { 
+        file_id: String 
+    },
+    FileDownloadResponse { 
+        file_id: String, 
+        available: bool, 
+        filename: Option<String>, 
+        file_size: Option<u64>, 
+        mime_type: Option<String> 
+    },
+    FileListRequest,
+    FileListResponse { 
+        files: Vec<crate::file_transfer::FileInfo> 
+    },
+    FileProgress { 
+        file_id: String, 
+        bytes_transferred: u64, 
+        total_bytes: u64, 
+        percentage: f32 
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -133,10 +248,16 @@ impl Message {
 
     fn validate_content(content: &str) -> Result<(), ClientError> {
         if content.is_empty() {
-            return Err(ClientError::SerializationError("Empty content".to_string()));
+            return Err(ClientError::SerializationError {
+                message_type: "Message content".to_string(),
+                reason: "Empty content".to_string(),
+            });
         }
         if content.len() > 4096 {
-            return Err(ClientError::SerializationError("Content too long".to_string()));
+            return Err(ClientError::SerializationError {
+                message_type: "Message content".to_string(),
+                reason: "Content too long".to_string(),
+            });
         }
         Ok(())
     }
@@ -196,7 +317,11 @@ impl ConnectionManager {
                     println!("[Client] Sending handshake with username '{}'", self.username);
                     if let Err(e) = stream.write_all(format!("{}\n", self.username).as_bytes()).await {
                         eprintln!("[Client] Failed to send handshake: {}", e);
-                        return Err(ClientError::IoError(format!("Failed to send handshake: {}", e)));
+                        return Err(ClientError::IoError {
+                            operation: "handshake".to_string(),
+                            reason: e.to_string(),
+                            context: Some(format!("Sending username '{}' to {}", self.username, self.address)),
+                        });
                     }
                     self.stream = Some(stream);
                     self.retry_count = 0;
@@ -214,13 +339,21 @@ impl ConnectionManager {
                         sleep(Duration::from_secs(delay as u64)).await;
                     } else {
                         eprintln!("[Client] All connection attempts failed. Giving up.");
-                        return Err(ClientError::ConnectionError(format!("Failed after {} attempts: {}", self.max_retries + 1, e)));
+                        return Err(ClientError::ConnectionError {
+                            address: self.address.clone(),
+                            reason: format!("Failed after {} attempts", self.max_retries + 1),
+                            context: Some(format!("Last error: {}", e)),
+                        });
                     }
                 }
             }
         }
         eprintln!("[Client] Max retries exceeded. Unable to connect to server at {}", self.address);
-        Err(ClientError::ConnectionError("Max retries exceeded".to_string()))
+        Err(ClientError::ConnectionError {
+            address: self.address.clone(),
+            reason: "Max retries exceeded".to_string(),
+            context: None,
+        })
     }
 
     fn is_connected(&self) -> bool {
@@ -235,6 +368,7 @@ pub struct ChatClient {
     message_tx: Option<mpsc::Sender<String>>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
     stats: Arc<Mutex<ClientStats>>,
+    file_manager: Option<FileTransferManager>,
 }
 
 #[derive(Debug, Default)]
@@ -301,12 +435,16 @@ impl ChatClient {
 
     pub fn new(username: String, server_address: String) -> Self {
         let connection_manager = ConnectionManager::new(server_address, username);
+        // Initialize file manager with downloads directory
+        let file_manager = FileTransferManager::new("./downloads").ok();
+        
         Self {
             connection_manager,
             running: Arc::new(AtomicBool::new(false)),
             message_tx: None,
             shutdown_rx: None,
             stats: Arc::new(Mutex::new(ClientStats::new())),
+            file_manager,
         }
     }
 
@@ -318,7 +456,7 @@ impl ChatClient {
                 self.connection_manager.stream = Some(stream);
                 self.running.store(true, Ordering::SeqCst);
                 println!("[Client] Connected to server! You can now start chatting.");
-                println!("[Client] Commands: /help, /users, /channels, /stats, /quit");
+                println!("[Client] Commands: /help, /users, /channels, /stats, /upload, /download, /files, /quit");
                 println!("[Client] Type your message and press Enter to send.");
                 Ok(())
             }
@@ -363,7 +501,11 @@ impl ChatClient {
         // Receiver task needs these clones
         // Extract stream and create shutdown/message channels at the top
         let stream = self.connection_manager.stream.take()
-            .ok_or(ClientError::ConnectionError("Not connected to server".to_string()))?;
+            .ok_or(ClientError::ConnectionError {
+                address: "unknown".to_string(),
+                reason: "Not connected to server".to_string(),
+                context: None,
+            })?;
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (message_tx, message_rx) = mpsc::channel(32);
 
@@ -413,13 +555,28 @@ impl ChatClient {
             let running_clone = Arc::clone(&self.running);
             let username_clone = self.connection_manager.username.clone();
             let stats_clone = Arc::clone(&self.stats);
+            // Don't clone file_manager, just pass the reference
             async move {
                 use tokio::io::AsyncWriteExt;
                 loop {
                     tokio::select! {
                         Some(input) = message_rx.recv() => {
                             let result = if input.starts_with('/') {
-                                writer_stream.write_all(format!("{}\n", input).as_bytes()).await.map_err(ClientError::from)
+                                // Handle file transfer commands locally first - no file manager for now
+                                match Self::handle_command(input.clone(), None, &mut writer_stream).await {
+                                    Ok(handled) => {
+                                        if !handled {
+                                            // Command not handled locally, send to server
+                                            writer_stream.write_all(format!("{}\n", input).as_bytes()).await.map_err(ClientError::from)
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Command error: {}", e);
+                                        Ok(())
+                                    }
+                                }
                             } else {
                                 let message = Message::new_chat(username_clone.clone(), input);
                                 let json = serde_json::to_string(&message)?;
@@ -475,6 +632,150 @@ impl ChatClient {
         println!("Disconnected from server.");
         Ok(())
     }
+    
+    // File transfer methods
+    
+    /// Upload a file to the server
+    pub async fn upload_file<P: AsRef<Path>>(&mut self, file_path: P) -> Result<String, ClientError> {
+        let file_path = file_path.as_ref();
+        
+        if let Some(ref mut file_manager) = self.file_manager {
+            // Read file
+            let mut file = File::open(file_path).await
+                .map_err(|e| ClientError::IoError {
+                    operation: "open file".to_string(),
+                    reason: e.to_string(),
+                    context: Some(file_path.display().to_string()),
+                })?;
+            
+            let mut file_data = Vec::new();
+            file.read_to_end(&mut file_data).await
+                .map_err(|e| ClientError::IoError {
+                    operation: "read file".to_string(),
+                    reason: e.to_string(),
+                    context: Some(file_path.display().to_string()),
+                })?;
+            
+            let filename = file_path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| ClientError::IoError {
+                    operation: "get filename".to_string(),
+                    reason: "Invalid filename".to_string(),
+                    context: Some(file_path.display().to_string()),
+                })?;
+            
+            let file_size = file_data.len() as u64;
+            let checksum = utils::calculate_checksum(&file_data);
+            let mime_type = "application/octet-stream"; // TODO: Better MIME detection
+            
+            // Start upload session
+            let file_id = file_manager.start_upload(
+                filename.to_string(),
+                file_size,
+                mime_type.to_string(),
+                checksum.clone(),
+            ).map_err(|e| ClientError::SerializationError {
+                message_type: "file upload".to_string(),
+                reason: e,
+            })?;
+            
+            // Send upload request
+            let upload_msg = Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender: self.connection_manager.username.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                version: 1,
+                message_type: MessageType::FileUploadRequest {
+                    file_id: file_id.clone(),
+                    filename: filename.to_string(),
+                    file_size,
+                    mime_type: mime_type.to_string(),
+                    checksum,
+                },
+                channel: None,
+                metadata: HashMap::new(),
+            };
+            
+            self.send_message_direct(upload_msg).await?;
+            
+            println!("File upload initiated: {} ({})", filename, utils::format_file_size(file_size));
+            Ok(file_id)
+        } else {
+            Err(ClientError::ConfigurationError {
+                field: "file_manager".to_string(),
+                value: "none".to_string(),
+                reason: "File transfer not initialized".to_string(),
+            })
+        }
+    }
+    
+    /// List files available on the server
+    pub async fn list_files(&mut self) -> Result<(), ClientError> {
+        let list_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: self.connection_manager.username.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            version: 1,
+            message_type: MessageType::FileListRequest,
+            channel: None,
+            metadata: HashMap::new(),
+        };
+        
+        self.send_message_direct(list_msg).await?;
+        Ok(())
+    }
+    
+    /// Download a file from the server
+    pub async fn download_file(&mut self, file_id: String) -> Result<(), ClientError> {
+        let download_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: self.connection_manager.username.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            version: 1,
+            message_type: MessageType::FileDownloadRequest { file_id },
+            channel: None,
+            metadata: HashMap::new(),
+        };
+        
+        self.send_message_direct(download_msg).await?;
+        Ok(())
+    }
+    
+    /// Send a message directly (internal helper)
+    async fn send_message_direct(&mut self, message: Message) -> Result<(), ClientError> {
+        if let Some(ref mut stream) = self.connection_manager.stream {
+            let json = serde_json::to_string(&message)
+                .map_err(|e| ClientError::SerializationError {
+                    message_type: "message".to_string(),
+                    reason: e.to_string(),
+                })?;
+            
+            stream.write_all(format!("{}\n", json).as_bytes()).await
+                .map_err(|e| ClientError::IoError {
+                    operation: "send message".to_string(),
+                    reason: e.to_string(),
+                    context: Some("direct message send".to_string()),
+                })?;
+            
+            Ok(())
+        } else {
+            Err(ClientError::ConnectionError {
+                address: self.connection_manager.address.clone(),
+                reason: "Not connected".to_string(),
+                context: Some("send_message_direct".to_string()),
+            })
+        }
+    }
+    
     // End of ChatClient impl
 
     fn print_help(&self) {
@@ -483,7 +784,181 @@ impl ChatClient {
         println!("  /users    - List connected users");
         println!("  /channels - List available channels");
         println!("  /stats    - Show client statistics");
+        println!("  /upload <path> - Upload a file to the server");
+        println!("  /download <filename> - Download a file from the server");
+        println!("  /files    - List files available on the server");
         println!("  /quit     - Exit the chat");
+    }
+
+    /// Handle client-side commands, returns true if command was handled locally
+    async fn handle_command(
+        input: String,
+        file_manager: Option<FileTransferManager>,
+        stream: &mut tokio::net::tcp::OwnedWriteHalf,
+    ) -> Result<bool, ClientError> {
+        use tokio::io::AsyncWriteExt;
+        
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        if parts.is_empty() {
+            return Ok(false);
+        }
+
+        match parts[0] {
+            "/help" => {
+                println!("Available commands:");
+                println!("  /help     - Show this help");
+                println!("  /users    - List connected users");
+                println!("  /channels - List available channels");
+                println!("  /stats    - Show client statistics");
+                println!("  /upload <path> - Upload a file to the server");
+                println!("  /download <filename> - Download a file from the server");
+                println!("  /files    - List files available on the server");
+                println!("  /quit     - Exit the chat");
+                Ok(true)
+            }
+            "/upload" => {
+                if parts.len() < 2 {
+                    println!("Usage: /upload <file_path>");
+                    return Ok(true);
+                }
+                
+                let file_path = parts[1..].join(" "); // Handle paths with spaces
+                println!("Uploading file: {}", file_path);
+                
+                // Basic file existence check
+                if !std::path::Path::new(&file_path).exists() {
+                    println!("File not found: {}", file_path);
+                    return Ok(true);
+                }
+                
+                // Read file size
+                let metadata = std::fs::metadata(&file_path);
+                let file_size = match metadata {
+                    Ok(meta) => meta.len(),
+                    Err(e) => {
+                        println!("Error reading file metadata: {}", e);
+                        return Ok(true);
+                    }
+                };
+                
+                // Generate file ID and get filename
+                let file_id = uuid::Uuid::new_v4().to_string();
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                
+                println!("File validation passed. Size: {} bytes", file_size);
+                
+                // Create upload request message
+                let upload_request = MessageType::FileUploadRequest {
+                    file_id,
+                    filename,
+                    file_size,
+                    mime_type: "application/octet-stream".to_string(), // Default MIME type
+                    checksum: "".to_string(), // Will be calculated during upload
+                };
+                
+                let message = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: "client".to_string(),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    version: 1,
+                    message_type: upload_request,
+                    channel: None,
+                    metadata: HashMap::new(),
+                };
+                
+                let json = serde_json::to_string(&message)
+                    .map_err(|e| ClientError::SerializationError {
+                        message_type: "file upload request".to_string(),
+                        reason: e.to_string(),
+                    })?;
+                
+                stream.write_all(format!("{}\n", json).as_bytes()).await
+                    .map_err(|e| ClientError::IoError {
+                        operation: "send upload request".to_string(),
+                        reason: e.to_string(),
+                        context: Some("upload command".to_string()),
+                    })?;
+                
+                println!("Upload request sent to server");
+                Ok(true)
+            }
+            "/download" => {
+                if parts.len() < 2 {
+                    println!("Usage: /download <filename>");
+                    return Ok(true);
+                }
+                
+                let file_id = parts[1..].join(" ");
+                println!("Requesting download: {}", file_id);
+                
+                // Create download request message
+                let download_request = MessageType::FileDownloadRequest {
+                    file_id: file_id.clone(),
+                };
+                
+                let message = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: "client".to_string(),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    version: 1,
+                    message_type: download_request,
+                    channel: None,
+                    metadata: HashMap::new(),
+                };
+                
+                let json = serde_json::to_string(&message)
+                    .map_err(|e| ClientError::SerializationError {
+                        message_type: "file download request".to_string(),
+                        reason: e.to_string(),
+                    })?;
+                
+                stream.write_all(format!("{}\n", json).as_bytes()).await
+                    .map_err(|e| ClientError::IoError {
+                        operation: "send download request".to_string(),
+                        reason: e.to_string(),
+                        context: Some("download command".to_string()),
+                    })?;
+                
+                println!("Download request sent to server");
+                Ok(true)
+            }
+            "/files" => {
+                println!("Requesting file list from server...");
+                
+                // Create file list request message
+                let list_request = MessageType::FileListRequest;
+                
+                let message = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: "client".to_string(),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    version: 1,
+                    message_type: list_request,
+                    channel: None,
+                    metadata: HashMap::new(),
+                };
+                
+                let json = serde_json::to_string(&message)
+                    .map_err(|e| ClientError::SerializationError {
+                        message_type: "file list request".to_string(),
+                        reason: e.to_string(),
+                    })?;
+                
+                stream.write_all(format!("{}\n", json).as_bytes()).await
+                    .map_err(|e| ClientError::IoError {
+                        operation: "send file list request".to_string(),
+                        reason: e.to_string(),
+                        context: Some("files command".to_string()),
+                    })?;
+                
+                Ok(true)
+            }
+            _ => Ok(false), // Command not handled locally
+        }
     }
 
 async fn message_receiver(
@@ -588,6 +1063,45 @@ async fn message_sender(
             }
             MessageType::Heartbeat => {
                 // Don't display heartbeat messages
+            }
+            MessageType::FileUploadResponse { file_id, accepted, reason, chunk_size: _ } => {
+                if *accepted {
+                    println!("*** File upload accepted: {} (ID: {})", reason.as_deref().unwrap_or("Ready"), file_id);
+                } else {
+                    println!("*** File upload rejected: {}", reason.as_deref().unwrap_or("Unknown error"));
+                }
+            }
+            MessageType::FileDownloadResponse { file_id: _, available, filename, file_size, mime_type: _ } => {
+                if *available {
+                    println!("*** File download ready: {} ({} bytes)", 
+                        filename.as_deref().unwrap_or("unknown"), 
+                        file_size.unwrap_or(0));
+                } else {
+                    println!("*** File not available for download");
+                }
+            }
+            MessageType::FileListResponse { files } => {
+                if files.is_empty() {
+                    println!("*** No files available on server");
+                } else {
+                    println!("*** Available files:");
+                    for file in files {
+                        println!("  - {} ({} bytes, uploaded: {})", 
+                            file.filename, 
+                            file.file_size,
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(file.uploaded_at.timestamp(), 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                    }
+                }
+            }
+            MessageType::FileChunk { .. } => {
+                // File chunks are handled internally, not displayed
+            }
+            _ => {
+                // Handle other message types that might be added
+                println!("*** Received message: {:?}", message.message_type);
             }
         }
     }

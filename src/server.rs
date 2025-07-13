@@ -4,10 +4,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use tracing::{info, warn, error, debug};
+use crate::file_transfer::{FileTransferManager, FileInfo};
+use crate::file_transfer::utils;
 
 // Enhanced message types with versioning and metadata
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -19,6 +20,57 @@ pub enum MessageType {
     UserLeft { username: String },
     Heartbeat,
     Error { code: u32, message: String },
+    CommandResponse { command: String, response: String },
+    // File transfer message types
+    FileUploadRequest { 
+        file_id: String, 
+        filename: String, 
+        file_size: u64, 
+        mime_type: String, 
+        checksum: String 
+    },
+    FileUploadResponse { 
+        file_id: String, 
+        accepted: bool, 
+        reason: Option<String>, 
+        chunk_size: usize 
+    },
+    FileChunk { 
+        file_id: String, 
+        chunk_index: u32, 
+        total_chunks: u32, 
+        data: String 
+    },
+    FileChunkAck { 
+        file_id: String, 
+        chunk_index: u32, 
+        received: bool 
+    },
+    FileUploadComplete { 
+        file_id: String, 
+        success: bool, 
+        message: String 
+    },
+    FileDownloadRequest { 
+        file_id: String 
+    },
+    FileDownloadResponse { 
+        file_id: String, 
+        available: bool, 
+        filename: Option<String>, 
+        file_size: Option<u64>, 
+        mime_type: Option<String> 
+    },
+    FileListRequest,
+    FileListResponse { 
+        files: Vec<FileInfo> 
+    },
+    FileProgress { 
+        file_id: String, 
+        bytes_transferred: u64, 
+        total_bytes: u64, 
+        percentage: f32 
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -152,6 +204,7 @@ pub struct ChatServer {
     channels: Arc<RwLock<HashMap<String, Channel>>>,
     message_rate_limiter: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
     config: ServerConfig,
+    file_manager: Arc<RwLock<FileTransferManager>>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +221,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:80".to_string(),
+            bind_address: "0.0.0.0:10420".to_string(),
             max_clients: 100,
             heartbeat_interval: Duration::from_secs(30),
             client_timeout: Duration::from_secs(90),
@@ -184,11 +237,19 @@ impl ChatServer {
         let mut channels = HashMap::new();
         channels.insert("general".to_string(), Channel::new("general".to_string()));
         
+        // Initialize file transfer manager with server uploads directory
+        let file_manager = FileTransferManager::new("./server_uploads")
+            .unwrap_or_else(|e| {
+                error!("Failed to initialize file transfer manager: {}", e);
+                panic!("Cannot start server without file transfer capability");
+            });
+        
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(channels)),
             message_rate_limiter: Arc::new(RwLock::new(HashMap::new())),
             config,
+            file_manager: Arc::new(RwLock::new(file_manager)),
         }
     }
 
@@ -213,10 +274,11 @@ impl ChatServer {
                     let clients = Arc::clone(&self.clients);
                     let channels = Arc::clone(&self.channels);
                     let rate_limiter = Arc::clone(&self.message_rate_limiter);
+                    let file_manager = Arc::clone(&self.file_manager);
                     let config = self.config.clone();
 
                     thread::spawn(move || {
-                        if let Err(e) = Self::handle_client(stream, clients, channels, rate_limiter, config) {
+                        if let Err(e) = Self::handle_client(stream, clients, channels, rate_limiter, file_manager, config) {
                             error!("[Server] Error handling client: {}", e);
                         }
                     });
@@ -235,6 +297,7 @@ impl ChatServer {
         clients: Arc<RwLock<HashMap<String, Client>>>,
         channels: Arc<RwLock<HashMap<String, Channel>>>,
         rate_limiter: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
+        file_manager: Arc<RwLock<FileTransferManager>>,
         config: ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
@@ -324,6 +387,32 @@ impl ChatServer {
                         continue;
                     }
 
+                    // Command handling
+                    if received == "/channels" {
+                        let channel_names: Vec<String> = channels.read().unwrap().keys().cloned().collect();
+                        let response = Message::new(
+                            "server".to_string(),
+                            MessageType::CommandResponse {
+                                command: "/channels".to_string(),
+                                response: format!("Available channels: {}", channel_names.join(", ")),
+                            },
+                        );
+                        Self::send_to_client(&response, &client_id, &clients)?;
+                        continue;
+                    }
+                    if received == "/users" {
+                        let user_names: Vec<String> = clients.read().unwrap().values().map(|c| c.username.clone()).collect();
+                        let response = Message::new(
+                            "server".to_string(),
+                            MessageType::CommandResponse {
+                                command: "/users".to_string(),
+                                response: format!("Connected users: {}", user_names.join(", ")),
+                            },
+                        );
+                        Self::send_to_client(&response, &client_id, &clients)?;
+                        continue;
+                    }
+
                     // Parse and handle message
                     let message: Message = match serde_json::from_str(received) {
                         Ok(msg) => msg,
@@ -354,6 +443,19 @@ impl ChatServer {
                         MessageType::Heartbeat => {
                             debug!("[Server] Received heartbeat from '{}' at {}", username, peer_addr);
                             // Heartbeat handled by client update above
+                        }
+                        // File transfer message handling
+                        MessageType::FileUploadRequest { file_id, filename, file_size, mime_type, checksum } => {
+                            Self::handle_file_upload_request(&client_id, file_id, filename, *file_size, mime_type, checksum, &file_manager, &clients)?;
+                        }
+                        MessageType::FileChunk { file_id, chunk_index, total_chunks, data } => {
+                            Self::handle_file_chunk(&client_id, file_id, *chunk_index, *total_chunks, data, &file_manager, &clients)?;
+                        }
+                        MessageType::FileDownloadRequest { file_id } => {
+                            Self::handle_file_download_request(&client_id, file_id, &file_manager, &clients)?;
+                        }
+                        MessageType::FileListRequest => {
+                            Self::handle_file_list_request(&client_id, &file_manager, &clients)?;
                         }
                         _ => {
                             // Handle other message types
@@ -510,6 +612,194 @@ impl ChatServer {
                 });
             }
         });
+    }
+    
+    // File transfer handler methods
+    fn handle_file_upload_request(
+        client_id: &str,
+        file_id: &str,
+        filename: &str,
+        file_size: u64,
+        mime_type: &str,
+        checksum: &str,
+        file_manager: &Arc<RwLock<FileTransferManager>>,
+        clients: &Arc<RwLock<HashMap<String, Client>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("[Server] File upload request from {}: {} ({} bytes)", client_id, filename, file_size);
+        
+        let response = {
+            let file_mgr = file_manager.read().unwrap();
+            match file_mgr.validate_file(filename, file_size, mime_type) {
+                Ok(()) => {
+                    // Start upload session
+                    drop(file_mgr);
+                    let mut file_mgr = file_manager.write().unwrap();
+                    match file_mgr.start_upload(filename.to_string(), file_size, mime_type.to_string(), checksum.to_string()) {
+                        Ok(session_file_id) => {
+                            info!("[Server] Upload accepted for file: {} (ID: {})", filename, session_file_id);
+                            MessageType::FileUploadResponse {
+                                file_id: session_file_id,
+                                accepted: true,
+                                reason: Some("Upload accepted".to_string()),
+                                chunk_size: 64 * 1024, // Use CHUNK_SIZE constant value
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[Server] Failed to start upload session: {}", e);
+                            MessageType::FileUploadResponse {
+                                file_id: file_id.to_string(),
+                                accepted: false,
+                                reason: Some(e),
+                                chunk_size: 64 * 1024,
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[Server] File validation failed: {}", e);
+                    MessageType::FileUploadResponse {
+                        file_id: file_id.to_string(),
+                        accepted: false,
+                        reason: Some(e),
+                        chunk_size: 64 * 1024,
+                    }
+                }
+            }
+        };
+        
+        let message = Message::new("server".to_string(), response);
+        Self::send_to_client(&message, client_id, clients)
+    }
+    
+    fn handle_file_chunk(
+        client_id: &str,
+        file_id: &str,
+        chunk_index: u32,
+        total_chunks: u32,
+        data: &str,
+        file_manager: &Arc<RwLock<FileTransferManager>>,
+        clients: &Arc<RwLock<HashMap<String, Client>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("[Server] Received chunk {} of {} for file {}", chunk_index, total_chunks, file_id);
+        
+        let result = {
+            let mut file_mgr = file_manager.write().unwrap();
+            // Decode base64 data using the new API
+            match utils::decode_base64(data) {
+                Ok(chunk_data_vec) => {
+                    // Process the chunk asynchronously in a blocking context
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(file_mgr.process_chunk(file_id, chunk_index, &chunk_data_vec))
+                }
+                Err(e) => Err(format!("Failed to decode chunk data: {}", e))
+            }
+        };
+        
+        let ack_message = MessageType::FileChunkAck {
+            file_id: file_id.to_string(),
+            chunk_index,
+            received: result.is_ok(),
+        };
+        
+        let message = Message::new("server".to_string(), ack_message);
+        Self::send_to_client(&message, client_id, clients)?;
+        
+        // If this was the last chunk, complete the upload
+        if chunk_index + 1 == total_chunks && result.is_ok() {
+            let completion_result = {
+                let mut file_mgr = file_manager.write().unwrap();
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(file_mgr.complete_upload(file_id))
+            };
+            
+            let is_success = completion_result.is_ok();
+            let complete_message = MessageType::FileUploadComplete {
+                file_id: file_id.to_string(),
+                success: is_success,
+                message: match completion_result {
+                    Ok(()) => "File upload completed successfully".to_string(),
+                    Err(e) => format!("Upload completion failed: {}", e),
+                },
+            };
+            
+            let message = Message::new("server".to_string(), complete_message);
+            Self::send_to_client(&message, client_id, clients)?;
+            
+            if is_success {
+                info!("[Server] File upload completed successfully: {}", file_id);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn handle_file_download_request(
+        client_id: &str,
+        file_id: &str,
+        file_manager: &Arc<RwLock<FileTransferManager>>,
+        clients: &Arc<RwLock<HashMap<String, Client>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("[Server] File download request from {}: {}", client_id, file_id);
+        
+        let response = {
+            let file_mgr = file_manager.read().unwrap();
+            match file_mgr.get_file_info(file_id) {
+                Some(file_info) => {
+                    MessageType::FileDownloadResponse {
+                        file_id: file_id.to_string(),
+                        available: true,
+                        filename: Some(file_info.filename.clone()),
+                        file_size: Some(file_info.file_size),
+                        mime_type: Some(file_info.mime_type.clone()),
+                    }
+                }
+                None => {
+                    MessageType::FileDownloadResponse {
+                        file_id: file_id.to_string(),
+                        available: false,
+                        filename: None,
+                        file_size: None,
+                        mime_type: None,
+                    }
+                }
+            }
+        };
+        
+        let message = Message::new("server".to_string(), response);
+        Self::send_to_client(&message, client_id, clients)
+    }
+    
+    fn handle_file_list_request(
+        client_id: &str,
+        file_manager: &Arc<RwLock<FileTransferManager>>,
+        clients: &Arc<RwLock<HashMap<String, Client>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("[Server] File list request from {}", client_id);
+        
+        let files = {
+            let file_mgr = file_manager.read().unwrap();
+            file_mgr.list_files()
+        };
+        
+        let response = MessageType::FileListResponse { files };
+        let message = Message::new("server".to_string(), response);
+        Self::send_to_client(&message, client_id, clients)
+    }
+    
+    fn send_to_client(
+        message: &Message,
+        client_id: &str,
+        clients: &Arc<RwLock<HashMap<String, Client>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let clients_lock = clients.read().unwrap();
+        if let Some(client) = clients_lock.get(client_id) {
+            let json = serde_json::to_string(message)?;
+            let mut writer = BufWriter::new(client.stream.try_clone()?);
+            writeln!(writer, "{}", json)?;
+            writer.flush()?;
+            debug!("[Server] Sent message to client {}: {:?}", client_id, message.message_type);
+        }
+        Ok(())
     }
 }
 

@@ -1,0 +1,14 @@
+# TCP Messaging Client Configuration
+
+server_address = "192.168.0.112"
+port = 80
+# username = "your-default-username"
+auto_reconnect = true
+max_retries = 5
+timeout_secs = 30
+
+[logging]
+level = "info"
+format = "pretty"  # "json" or "pretty"
+# file_path = "./logs/client.log"  # Uncomment to enable file logging
+max_file_size_mb = 10
